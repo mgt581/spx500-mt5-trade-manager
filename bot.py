@@ -3,30 +3,43 @@ SPX500 MT5 Trade Manager
 
 Default mode is DRY_RUN=True so the bot will NOT place real trades unless you
 explicitly change the config. Use a demo account first.
+
+Note for Mac users:
+The official MetaTrader5 Python package is Windows-only. On Mac, run this bot
+in simulated dry-run mode, or run live/demo MT5 execution from Windows/VPS.
 """
 
 from __future__ import annotations
 
 import csv
+import math
 import os
+import random
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
-import MetaTrader5 as mt5
+try:
+    import MetaTrader5 as mt5  # type: ignore
+    MT5_AVAILABLE = True
+except ModuleNotFoundError:
+    mt5 = None  # type: ignore
+    MT5_AVAILABLE = False
 
 Signal = Literal["BUY", "SELL", "HOLD"]
+TIMEFRAME_M5 = 5
 
 
 @dataclass(frozen=True)
 class BotConfig:
     symbol: str = os.getenv("BOT_SYMBOL", "SPX500")
-    timeframe: int = int(os.getenv("BOT_TIMEFRAME", mt5.TIMEFRAME_M5))
+    timeframe: int = int(os.getenv("BOT_TIMEFRAME", str(getattr(mt5, "TIMEFRAME_M5", TIMEFRAME_M5))))
     candles: int = int(os.getenv("BOT_CANDLES", "120"))
     poll_seconds: int = int(os.getenv("BOT_POLL_SECONDS", "10"))
     dry_run: bool = os.getenv("BOT_DRY_RUN", "true").lower() == "true"
+    simulate_data: bool = os.getenv("BOT_SIMULATE_DATA", "false").lower() == "true"
     risk_percent: float = float(os.getenv("BOT_RISK_PERCENT", "1.0"))
     max_trades_per_day: int = int(os.getenv("BOT_MAX_TRADES_PER_DAY", "3"))
     max_spread_points: float = float(os.getenv("BOT_MAX_SPREAD_POINTS", "50"))
@@ -60,19 +73,10 @@ class TradeLogger:
 
 
 class PullbackStrategy:
-    """
-    Simple first-pullback style logic:
-    - Find recent high/low structure.
-    - If price breaks upward then pulls back but remains above recent average, BUY.
-    - If price breaks downward then pulls back but remains below recent average, SELL.
-
-    This is intentionally conservative and should be backtested before live use.
-    """
-
     def __init__(self, lookback: int = 20) -> None:
         self.lookback = lookback
 
-    def signal(self, rates: list) -> Signal:
+    def signal(self, rates: list[list[float]]) -> Signal:
         if len(rates) < self.lookback + 5:
             return "HOLD"
 
@@ -103,8 +107,20 @@ class MT5TradeManager:
         self.logger = TradeLogger(config.log_file)
         self.trades_today = 0
         self.current_day = datetime.now().date()
+        self.sim_price = 5000.0
 
     def connect(self) -> None:
+        if self.config.simulate_data:
+            print(f"Simulation mode | symbol={self.config.symbol} | dry_run={self.config.dry_run}")
+            return
+
+        if not MT5_AVAILABLE:
+            raise RuntimeError(
+                "MetaTrader5 Python package is not available on this machine. "
+                "On Mac, set BOT_SIMULATE_DATA=true in .env for dry-run testing, "
+                "or run MT5 execution on Windows/VPS."
+            )
+
         if not mt5.initialize():
             raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
         if not mt5.symbol_select(self.config.symbol, True):
@@ -112,7 +128,8 @@ class MT5TradeManager:
         print(f"Connected to MT5 | symbol={self.config.symbol} | dry_run={self.config.dry_run}")
 
     def shutdown(self) -> None:
-        mt5.shutdown()
+        if MT5_AVAILABLE and not self.config.simulate_data:
+            mt5.shutdown()
 
     def reset_daily_count_if_needed(self) -> None:
         today = datetime.now().date()
@@ -120,19 +137,34 @@ class MT5TradeManager:
             self.current_day = today
             self.trades_today = 0
 
-    def get_rates(self) -> Optional[list]:
-        rates = mt5.copy_rates_from_pos(
-            self.config.symbol,
-            self.config.timeframe,
-            0,
-            self.config.candles,
-        )
+    def get_rates(self) -> Optional[list[list[float]]]:
+        if self.config.simulate_data:
+            return self.get_simulated_rates()
+
+        rates = mt5.copy_rates_from_pos(self.config.symbol, self.config.timeframe, 0, self.config.candles)
         if rates is None:
             print(f"No rates returned: {mt5.last_error()}")
             return None
         return rates.tolist()
 
+    def get_simulated_rates(self) -> list[list[float]]:
+        rows: list[list[float]] = []
+        base_time = int(time.time()) - self.config.candles * 300
+        for index in range(self.config.candles):
+            wave = math.sin(index / 8) * 12
+            noise = random.uniform(-3, 3)
+            close = self.sim_price + wave + noise + index * 0.05
+            open_price = close + random.uniform(-2, 2)
+            high = max(open_price, close) + random.uniform(1, 5)
+            low = min(open_price, close) - random.uniform(1, 5)
+            rows.append([base_time + index * 300, open_price, high, low, close, 0, 0, 0])
+        self.sim_price = rows[-1][4]
+        return rows
+
     def spread_is_ok(self) -> bool:
+        if self.config.simulate_data:
+            return True
+
         tick = mt5.symbol_info_tick(self.config.symbol)
         info = mt5.symbol_info(self.config.symbol)
         if tick is None or info is None:
@@ -144,6 +176,9 @@ class MT5TradeManager:
         return True
 
     def calculate_volume(self) -> float:
+        if self.config.simulate_data:
+            return 0.01
+
         account = mt5.account_info()
         info = mt5.symbol_info(self.config.symbol)
         if account is None or info is None:
@@ -161,7 +196,7 @@ class MT5TradeManager:
         volume = round(volume / step) * step
         return round(volume, 2)
 
-    def place_order(self, signal: Signal) -> None:
+    def place_order(self, signal: Signal, rates: list[list[float]]) -> None:
         if signal == "HOLD":
             return
 
@@ -172,15 +207,20 @@ class MT5TradeManager:
         if not self.spread_is_ok():
             return
 
-        tick = mt5.symbol_info_tick(self.config.symbol)
-        info = mt5.symbol_info(self.config.symbol)
-        if tick is None or info is None:
-            print("Missing tick or symbol info")
-            return
+        volume = self.calculate_volume()
+        timestamp = datetime.now(timezone.utc).isoformat()
 
-        order_type = mt5.ORDER_TYPE_BUY if signal == "BUY" else mt5.ORDER_TYPE_SELL
-        price = tick.ask if signal == "BUY" else tick.bid
-        point = info.point
+        if self.config.simulate_data:
+            price = float(rates[-1][4])
+            point = 0.01
+        else:
+            tick = mt5.symbol_info_tick(self.config.symbol)
+            info = mt5.symbol_info(self.config.symbol)
+            if tick is None or info is None:
+                print("Missing tick or symbol info")
+                return
+            price = tick.ask if signal == "BUY" else tick.bid
+            point = info.point
 
         if signal == "BUY":
             sl = price - self.config.stop_loss_points * point
@@ -189,14 +229,12 @@ class MT5TradeManager:
             sl = price + self.config.stop_loss_points * point
             tp = price - self.config.take_profit_points * point
 
-        volume = self.calculate_volume()
-        timestamp = datetime.now(timezone.utc).isoformat()
-
-        if self.config.dry_run:
-            result_text = "DRY_RUN_ONLY"
-            print(f"DRY RUN {signal}: price={price}, volume={volume}, sl={sl}, tp={tp}")
+        if self.config.dry_run or self.config.simulate_data:
+            result_text = "DRY_RUN_ONLY" if self.config.dry_run else "SIMULATION_ONLY"
+            print(f"{result_text} {signal}: price={price:.2f}, volume={volume}, sl={sl:.2f}, tp={tp:.2f}")
         else:
-            request = {
+            order_type = mt5.ORDER_TYPE_BUY if signal == "BUY" else mt5.ORDER_TYPE_SELL
+            request: dict[str, Any] = {
                 "action": mt5.TRADE_ACTION_DEAL,
                 "symbol": self.config.symbol,
                 "volume": volume,
@@ -215,17 +253,7 @@ class MT5TradeManager:
             print(f"LIVE ORDER RESULT: {result_text}")
 
         self.trades_today += 1
-        self.logger.write([
-            timestamp,
-            self.config.symbol,
-            signal,
-            price,
-            volume,
-            sl,
-            tp,
-            self.config.dry_run,
-            result_text,
-        ])
+        self.logger.write([timestamp, self.config.symbol, signal, price, volume, sl, tp, self.config.dry_run, result_text])
 
 
 def main() -> None:
@@ -240,7 +268,7 @@ def main() -> None:
             if rates:
                 signal = strategy.signal(rates)
                 print(f"{datetime.now().strftime('%H:%M:%S')} signal={signal}")
-                manager.place_order(signal)
+                manager.place_order(signal, rates)
             time.sleep(config.poll_seconds)
     except KeyboardInterrupt:
         print("Bot stopped by user")
