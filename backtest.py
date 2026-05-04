@@ -35,50 +35,52 @@ class Trade:
 
 
 class PullbackStrategy:
-    def __init__(self, lookback: int = 30, breakout_buffer: float = 3.0, min_trend_slope: float = 0.25, min_range: float = 18.0) -> None:
+    def __init__(self, lookback: int = 24, breakout_buffer: float = 2.0, min_impulse: float = 7.5) -> None:
         self.lookback = lookback
         self.breakout_buffer = breakout_buffer
-        self.min_trend_slope = min_trend_slope
-        self.min_range = min_range
+        self.min_impulse = min_impulse
+
+    @staticmethod
+    def ema(values: list[float], period: int) -> float:
+        if not values:
+            return 0.0
+        multiplier = 2 / (period + 1)
+        ema_value = values[0]
+        for value in values[1:]:
+            ema_value = (value - ema_value) * multiplier + ema_value
+        return ema_value
 
     def signal(self, candles: list[Candle]) -> Signal:
-        if len(candles) < self.lookback + 10:
+        if len(candles) < max(self.lookback + 10, 60):
             return "HOLD"
 
         closes = [c.close for c in candles]
         highs = [c.high for c in candles]
         lows = [c.low for c in candles]
 
-        recent_closes = closes[-self.lookback - 2 : -2]
-        prior_closes = closes[-self.lookback - 8 : -8]
-        current = closes[-1]
-        previous = closes[-2]
-        current_low = lows[-1]
-        current_high = highs[-1]
-        recent_average = sum(recent_closes) / len(recent_closes)
-        prior_average = sum(prior_closes) / len(prior_closes)
-        recent_high = max(highs[-self.lookback - 2 : -2])
-        recent_low = min(lows[-self.lookback - 2 : -2])
-        recent_range = recent_high - recent_low
-        trend_slope = recent_average - prior_average
+        current = candles[-1]
+        previous = candles[-2]
+        recent_high = max(highs[-self.lookback - 3 : -3])
+        recent_low = min(lows[-self.lookback - 3 : -3])
 
-        if recent_range < self.min_range:
+        ema_fast = self.ema(closes[-50:], 10)
+        ema_slow = self.ema(closes[-80:], 30)
+        impulse = abs(previous.close - candles[-6].close)
+
+        if impulse < self.min_impulse:
             return "HOLD"
 
-        uptrend = trend_slope > self.min_trend_slope
-        downtrend = trend_slope < -self.min_trend_slope
+        buy_breakout = previous.close > recent_high + self.breakout_buffer
+        buy_pullback = current.low <= recent_high and current.close > recent_high and current.close > current.open
+        buy_trend = ema_fast > ema_slow
 
-        broke_up_recently = previous > recent_high + self.breakout_buffer
-        pullback_depth_ok = current_low <= recent_high and current > recent_average
-        bullish_rejection = current > candles[-1].open
+        sell_breakout = previous.close < recent_low - self.breakout_buffer
+        sell_pullback = current.high >= recent_low and current.close < recent_low and current.close < current.open
+        sell_trend = ema_fast < ema_slow
 
-        broke_down_recently = previous < recent_low - self.breakout_buffer
-        pullback_depth_ok_short = current_high >= recent_low and current < recent_average
-        bearish_rejection = current < candles[-1].open
-
-        if uptrend and broke_up_recently and pullback_depth_ok and bullish_rejection:
+        if buy_trend and buy_breakout and buy_pullback:
             return "BUY"
-        if downtrend and broke_down_recently and pullback_depth_ok_short and bearish_rejection:
+        if sell_trend and sell_breakout and sell_pullback:
             return "SELL"
         return "HOLD"
 
@@ -126,7 +128,7 @@ def run_backtest(
     cooldown_until = 0
     consecutive_losses = 0
 
-    for index in range(max(lookback + 10, 30), len(candles) - 1):
+    for index in range(max(lookback + 10, 60), len(candles) - 1):
         if index < cooldown_until:
             continue
         if len(trades) >= max_trades:
@@ -172,11 +174,7 @@ def run_backtest(
             continue
 
         trades.append(trade)
-        if trade.pnl < 0:
-            consecutive_losses += 1
-        else:
-            consecutive_losses = 0
-
+        consecutive_losses = consecutive_losses + 1 if trade.pnl < 0 else 0
         cooldown_until = index + 20
         if consecutive_losses >= max_consecutive_losses:
             cooldown_until = max(cooldown_until, index + loss_pause_candles)
@@ -234,7 +232,7 @@ def main() -> None:
     parser.add_argument("--tp", type=float, default=450)
     parser.add_argument("--point", type=float, default=0.01)
     parser.add_argument("--max-trades", type=int, default=50)
-    parser.add_argument("--lookback", type=int, default=30)
+    parser.add_argument("--lookback", type=int, default=24)
     parser.add_argument("--seed", type=int, default=581)
     parser.add_argument("--max-consecutive-losses", type=int, default=2)
     parser.add_argument("--loss-pause-candles", type=int, default=120)
