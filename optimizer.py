@@ -58,11 +58,11 @@ def metrics(trades) -> tuple[float, float, float, float]:
 
 
 def main() -> None:
-    # Ultra-fast mode: start small, prove the workflow, then scale up later.
     seeds = [581, 999]
     candles_count = 8000
     point = 0.01
     max_trades = 50
+    max_total_loss_points = 900
 
     stop_losses = [300]
     take_profits = [450, 500]
@@ -100,6 +100,7 @@ def main() -> None:
                 lookback=lookback,
                 max_consecutive_losses=max_losses,
                 loss_pause_candles=pause,
+                max_total_loss_points=max_total_loss_points,
             )
             pnl, win_rate, profit_factor, drawdown = metrics(trades)
             pnls.append(pnl)
