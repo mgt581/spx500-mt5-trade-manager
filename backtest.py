@@ -35,40 +35,65 @@ class Trade:
 
 
 class PullbackStrategy:
-    def __init__(self, lookback: int = 20) -> None:
+    def __init__(self, lookback: int = 20, breakout_buffer: float = 0.5) -> None:
         self.lookback = lookback
+        self.breakout_buffer = breakout_buffer
 
     def signal(self, candles: list[Candle]) -> Signal:
         if len(candles) < self.lookback + 5:
             return "HOLD"
 
         closes = [c.close for c in candles]
-        recent = closes[-self.lookback - 1 : -1]
+        highs = [c.high for c in candles]
+        lows = [c.low for c in candles]
+
+        recent_closes = closes[-self.lookback - 2 : -2]
         current = closes[-1]
         previous = closes[-2]
-        average = sum(recent) / len(recent)
-        recent_high = max(recent)
-        recent_low = min(recent)
+        current_low = lows[-1]
+        current_high = highs[-1]
+        average = sum(recent_closes) / len(recent_closes)
+        recent_high = max(recent_closes)
+        recent_low = min(recent_closes)
 
-        if previous > recent_high and current < previous and current > average:
+        uptrend = average > (sum(closes[-self.lookback - 6 : -6]) / self.lookback)
+        downtrend = average < (sum(closes[-self.lookback - 6 : -6]) / self.lookback)
+
+        broke_up_recently = previous > recent_high + self.breakout_buffer
+        pulled_back_but_held = current < previous and current_low <= recent_high and current > average
+
+        broke_down_recently = previous < recent_low - self.breakout_buffer
+        pulled_back_but_rejected = current > previous and current_high >= recent_low and current < average
+
+        if uptrend and broke_up_recently and pulled_back_but_held:
             return "BUY"
-        if previous < recent_low and current > previous and current < average:
+        if downtrend and broke_down_recently and pulled_back_but_rejected:
             return "SELL"
         return "HOLD"
 
 
-def generate_simulated_candles(count: int, start_price: float = 5000.0) -> list[Candle]:
+def generate_simulated_candles(count: int, start_price: float = 5000.0, seed: int = 581) -> list[Candle]:
+    random.seed(seed)
     candles: list[Candle] = []
     price = start_price
+    trend = 0.18
 
     for index in range(count):
-        trend = index * 0.015
-        wave = math.sin(index / 11) * 18
-        noise = random.uniform(-8, 8)
-        close = start_price + trend + wave + noise
+        if index % 180 == 0 and index > 0:
+            trend *= -1
+
+        impulse = 0.0
+        if index % 55 in {0, 1, 2}:
+            impulse = trend * 18
+        elif index % 55 in {3, 4, 5}:
+            impulse = -trend * 9
+
+        wave = math.sin(index / 13) * 5
+        noise = random.uniform(-4, 4)
+        close = price + trend + impulse + wave * 0.08 + noise
         open_price = price
-        high = max(open_price, close) + random.uniform(1, 7)
-        low = min(open_price, close) - random.uniform(1, 7)
+        high = max(open_price, close) + random.uniform(1, 6)
+        low = min(open_price, close) - random.uniform(1, 6)
         candles.append(Candle(open=open_price, high=high, low=low, close=close))
         price = close
 
@@ -81,11 +106,12 @@ def run_backtest(
     take_profit_points: float,
     point: float,
     max_trades: int,
+    lookback: int,
 ) -> list[Trade]:
-    strategy = PullbackStrategy()
+    strategy = PullbackStrategy(lookback=lookback)
     trades: list[Trade] = []
 
-    for index in range(30, len(candles) - 1):
+    for index in range(max(lookback + 10, 30), len(candles) - 1):
         if len(trades) >= max_trades:
             break
 
@@ -95,28 +121,40 @@ def run_backtest(
             continue
 
         entry = candles[index].close
-        future = candles[index + 1]
+        future_window = candles[index + 1 : min(index + 13, len(candles))]
 
         if signal == "BUY":
             sl = entry - stop_loss_points * point
             tp = entry + take_profit_points * point
-            if future.low <= sl:
-                trades.append(Trade(signal, entry, sl, tp, "LOSS", -stop_loss_points))
-            elif future.high >= tp:
-                trades.append(Trade(signal, entry, sl, tp, "WIN", take_profit_points))
-            else:
-                pnl = (future.close - entry) / point
-                trades.append(Trade(signal, entry, sl, tp, "OPEN_CANDLE_CLOSE", pnl))
+            closed = False
+            for future in future_window:
+                if future.low <= sl:
+                    trades.append(Trade(signal, entry, sl, tp, "LOSS", -stop_loss_points))
+                    closed = True
+                    break
+                if future.high >= tp:
+                    trades.append(Trade(signal, entry, sl, tp, "WIN", take_profit_points))
+                    closed = True
+                    break
+            if not closed and future_window:
+                pnl = (future_window[-1].close - entry) / point
+                trades.append(Trade(signal, entry, sl, tp, "TIME_EXIT", pnl))
         else:
             sl = entry + stop_loss_points * point
             tp = entry - take_profit_points * point
-            if future.high >= sl:
-                trades.append(Trade(signal, entry, sl, tp, "LOSS", -stop_loss_points))
-            elif future.low <= tp:
-                trades.append(Trade(signal, entry, sl, tp, "WIN", take_profit_points))
-            else:
-                pnl = (entry - future.close) / point
-                trades.append(Trade(signal, entry, sl, tp, "OPEN_CANDLE_CLOSE", pnl))
+            closed = False
+            for future in future_window:
+                if future.high >= sl:
+                    trades.append(Trade(signal, entry, sl, tp, "LOSS", -stop_loss_points))
+                    closed = True
+                    break
+                if future.low <= tp:
+                    trades.append(Trade(signal, entry, sl, tp, "WIN", take_profit_points))
+                    closed = True
+                    break
+            if not closed and future_window:
+                pnl = (entry - future_window[-1].close) / point
+                trades.append(Trade(signal, entry, sl, tp, "TIME_EXIT", pnl))
 
     return trades
 
@@ -147,15 +185,17 @@ def print_report(trades: list[Trade]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a simulated backtest.")
-    parser.add_argument("--candles", type=int, default=1000)
+    parser.add_argument("--candles", type=int, default=2000)
     parser.add_argument("--sl", type=float, default=250)
     parser.add_argument("--tp", type=float, default=500)
     parser.add_argument("--point", type=float, default=0.01)
     parser.add_argument("--max-trades", type=int, default=100)
+    parser.add_argument("--lookback", type=int, default=20)
+    parser.add_argument("--seed", type=int, default=581)
     args = parser.parse_args()
 
-    candles = generate_simulated_candles(args.candles)
-    trades = run_backtest(candles, args.sl, args.tp, args.point, args.max_trades)
+    candles = generate_simulated_candles(args.candles, seed=args.seed)
+    trades = run_backtest(candles, args.sl, args.tp, args.point, args.max_trades, args.lookback)
     print_report(trades)
 
 
