@@ -25,7 +25,6 @@ try:
     from dotenv import load_dotenv
     load_dotenv()
 except ModuleNotFoundError:
-    # python-dotenv is optional for simulation mode. Environment variables still work.
     pass
 
 try:
@@ -54,11 +53,14 @@ class BotConfig:
     poll_seconds: int = int(os.getenv("BOT_POLL_SECONDS", "10"))
     dry_run: bool = env_bool("BOT_DRY_RUN", True)
     simulate_data: bool = env_bool("BOT_SIMULATE_DATA", False)
-    risk_percent: float = float(os.getenv("BOT_RISK_PERCENT", "1.0"))
+    risk_percent: float = float(os.getenv("BOT_RISK_PERCENT", "0.5"))
     max_trades_per_day: int = int(os.getenv("BOT_MAX_TRADES_PER_DAY", "3"))
     max_spread_points: float = float(os.getenv("BOT_MAX_SPREAD_POINTS", "50"))
-    stop_loss_points: float = float(os.getenv("BOT_STOP_LOSS_POINTS", "250"))
+    stop_loss_points: float = float(os.getenv("BOT_STOP_LOSS_POINTS", "300"))
     take_profit_points: float = float(os.getenv("BOT_TAKE_PROFIT_POINTS", "500"))
+    max_total_loss_points: float = float(os.getenv("BOT_MAX_TOTAL_LOSS_POINTS", "900"))
+    max_consecutive_losses: int = int(os.getenv("BOT_MAX_CONSECUTIVE_LOSSES", "2"))
+    loss_pause_seconds: int = int(os.getenv("BOT_LOSS_PAUSE_SECONDS", "3600"))
     magic_number: int = int(os.getenv("BOT_MAGIC_NUMBER", "581500"))
     log_file: str = os.getenv("BOT_LOG_FILE", "trades.csv")
 
@@ -70,15 +72,8 @@ class TradeLogger:
             with self.path.open("w", newline="", encoding="utf-8") as file:
                 writer = csv.writer(file)
                 writer.writerow([
-                    "timestamp",
-                    "symbol",
-                    "signal",
-                    "price",
-                    "volume",
-                    "stop_loss",
-                    "take_profit",
-                    "dry_run",
-                    "result",
+                    "timestamp", "symbol", "signal", "price", "volume", "stop_loss",
+                    "take_profit", "dry_run", "result", "session_pnl_points",
                 ])
 
     def write(self, row: list[object]) -> None:
@@ -87,30 +82,88 @@ class TradeLogger:
 
 
 class PullbackStrategy:
-    def __init__(self, lookback: int = 20) -> None:
+    def __init__(
+        self,
+        lookback: int = 24,
+        breakout_buffer: float = 2.0,
+        min_impulse: float = 7.5,
+        min_ema_distance: float = 4.0,
+        max_ema_crosses: int = 4,
+        min_recent_range: float = 18.0,
+    ) -> None:
         self.lookback = lookback
+        self.breakout_buffer = breakout_buffer
+        self.min_impulse = min_impulse
+        self.min_ema_distance = min_ema_distance
+        self.max_ema_crosses = max_ema_crosses
+        self.min_recent_range = min_recent_range
+
+    @staticmethod
+    def ema(values: list[float], period: int) -> float:
+        if not values:
+            return 0.0
+        multiplier = 2 / (period + 1)
+        ema_value = values[0]
+        for value in values[1:]:
+            ema_value = (value - ema_value) * multiplier + ema_value
+        return ema_value
+
+    @staticmethod
+    def count_ema_crosses(closes: list[float], ema_value: float) -> int:
+        crosses = 0
+        previous_side = 0
+        for close in closes:
+            side = 1 if close > ema_value else -1 if close < ema_value else 0
+            if previous_side and side and side != previous_side:
+                crosses += 1
+            if side:
+                previous_side = side
+        return crosses
 
     def signal(self, rates: list[list[float]]) -> Signal:
-        if len(rates) < self.lookback + 5:
+        if len(rates) < max(self.lookback + 10, 80):
             return "HOLD"
 
+        opens = [float(candle[1]) for candle in rates]
+        highs = [float(candle[2]) for candle in rates]
+        lows = [float(candle[3]) for candle in rates]
         closes = [float(candle[4]) for candle in rates]
-        recent = closes[-self.lookback - 1 : -1]
-        current = closes[-1]
-        previous = closes[-2]
-        average = sum(recent) / len(recent)
-        recent_high = max(recent)
-        recent_low = min(recent)
 
-        broke_up = previous > recent_high
-        pulled_back_uptrend = current < previous and current > average
+        current_open = opens[-1]
+        current_high = highs[-1]
+        current_low = lows[-1]
+        current_close = closes[-1]
+        previous_close = closes[-2]
 
-        broke_down = previous < recent_low
-        pulled_back_downtrend = current > previous and current < average
+        recent_high = max(highs[-self.lookback - 3 : -3])
+        recent_low = min(lows[-self.lookback - 3 : -3])
+        recent_range = recent_high - recent_low
+        ema_fast = self.ema(closes[-50:], 10)
+        ema_slow = self.ema(closes[-80:], 30)
+        ema_distance = abs(ema_fast - ema_slow)
+        impulse = abs(previous_close - closes[-6])
+        crosses = self.count_ema_crosses(closes[-30:], ema_slow)
 
-        if broke_up and pulled_back_uptrend:
+        if ema_distance < self.min_ema_distance:
+            return "HOLD"
+        if crosses > self.max_ema_crosses:
+            return "HOLD"
+        if recent_range < self.min_recent_range:
+            return "HOLD"
+        if impulse < self.min_impulse:
+            return "HOLD"
+
+        buy_breakout = previous_close > recent_high + self.breakout_buffer
+        buy_pullback = current_low <= recent_high and current_close > recent_high and current_close > current_open
+        buy_trend = ema_fast > ema_slow and current_close > ema_fast
+
+        sell_breakout = previous_close < recent_low - self.breakout_buffer
+        sell_pullback = current_high >= recent_low and current_close < recent_low and current_close < current_open
+        sell_trend = ema_fast < ema_slow and current_close < ema_fast
+
+        if buy_trend and buy_breakout and buy_pullback:
             return "BUY"
-        if broke_down and pulled_back_downtrend:
+        if sell_trend and sell_breakout and sell_pullback:
             return "SELL"
         return "HOLD"
 
@@ -122,19 +175,20 @@ class MT5TradeManager:
         self.trades_today = 0
         self.current_day = datetime.now().date()
         self.sim_price = 5000.0
+        self.session_pnl_points = 0.0
+        self.consecutive_losses = 0
+        self.pause_until = 0.0
 
     def connect(self) -> None:
         if self.config.simulate_data:
             print(f"Simulation mode | symbol={self.config.symbol} | dry_run={self.config.dry_run}")
             return
-
         if not MT5_AVAILABLE:
             raise RuntimeError(
                 "MetaTrader5 Python package is not available on this machine. "
                 "On Mac, set BOT_SIMULATE_DATA=true in .env for dry-run testing, "
                 "or run MT5 execution on Windows/VPS."
             )
-
         if not mt5.initialize():
             raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
         if not mt5.symbol_select(self.config.symbol, True):
@@ -150,11 +204,23 @@ class MT5TradeManager:
         if today != self.current_day:
             self.current_day = today
             self.trades_today = 0
+            self.session_pnl_points = 0.0
+            self.consecutive_losses = 0
+            self.pause_until = 0.0
+
+    def circuit_breaker_allows_trade(self) -> bool:
+        if self.session_pnl_points <= -abs(self.config.max_total_loss_points):
+            print(f"Circuit breaker active: session PnL {self.session_pnl_points:.2f} pts")
+            return False
+        if time.time() < self.pause_until:
+            remaining = int(self.pause_until - time.time())
+            print(f"Loss pause active: {remaining}s remaining")
+            return False
+        return True
 
     def get_rates(self) -> Optional[list[list[float]]]:
         if self.config.simulate_data:
             return self.get_simulated_rates()
-
         rates = mt5.copy_rates_from_pos(self.config.symbol, self.config.timeframe, 0, self.config.candles)
         if rates is None:
             print(f"No rates returned: {mt5.last_error()}")
@@ -178,7 +244,6 @@ class MT5TradeManager:
     def spread_is_ok(self) -> bool:
         if self.config.simulate_data:
             return True
-
         tick = mt5.symbol_info_tick(self.config.symbol)
         info = mt5.symbol_info(self.config.symbol)
         if tick is None or info is None:
@@ -192,29 +257,37 @@ class MT5TradeManager:
     def calculate_volume(self) -> float:
         if self.config.simulate_data:
             return 0.01
-
         account = mt5.account_info()
         info = mt5.symbol_info(self.config.symbol)
         if account is None or info is None:
             return 0.01
-
         risk_cash = account.balance * (self.config.risk_percent / 100)
         estimated_loss_per_lot = max(self.config.stop_loss_points * info.point * 100, 1)
         volume = risk_cash / estimated_loss_per_lot
-
         min_volume = info.volume_min or 0.01
         max_volume = info.volume_max or 1.0
         step = info.volume_step or 0.01
-
         volume = max(min_volume, min(volume, max_volume))
         volume = round(volume / step) * step
         return round(volume, 2)
 
+    def record_trade_outcome(self, pnl_points: float) -> None:
+        self.session_pnl_points += pnl_points
+        if pnl_points < 0:
+            self.consecutive_losses += 1
+        else:
+            self.consecutive_losses = 0
+        if self.consecutive_losses >= self.config.max_consecutive_losses:
+            self.pause_until = time.time() + self.config.loss_pause_seconds
+            self.consecutive_losses = 0
+            print(f"Loss pause triggered for {self.config.loss_pause_seconds}s")
+
     def place_order(self, signal: Signal, rates: list[list[float]]) -> None:
         if signal == "HOLD":
             return
-
         self.reset_daily_count_if_needed()
+        if not self.circuit_breaker_allows_trade():
+            return
         if self.trades_today >= self.config.max_trades_per_day:
             print("Daily trade limit reached")
             return
@@ -264,17 +337,16 @@ class MT5TradeManager:
             }
             result = mt5.order_send(request)
             result_text = str(result)
-            print(f"LIVE ORDER RESULT: {result_text}")
+            print(f"DEMO/LIVE ORDER RESULT: {result_text}")
 
         self.trades_today += 1
-        self.logger.write([timestamp, self.config.symbol, signal, price, volume, sl, tp, self.config.dry_run, result_text])
+        self.logger.write([timestamp, self.config.symbol, signal, price, volume, sl, tp, self.config.dry_run, result_text, self.session_pnl_points])
 
 
 def main() -> None:
     config = BotConfig()
     strategy = PullbackStrategy()
     manager = MT5TradeManager(config)
-
     try:
         manager.connect()
         while True:
