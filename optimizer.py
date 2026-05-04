@@ -1,9 +1,9 @@
 """
-Mini optimizer for the SPX500 pullback strategy.
+Fast mini optimizer for the SPX500 pullback strategy.
 
 Purpose:
-- Test multiple parameter combinations across multiple random seeds.
-- Find robust settings before paper/demo trading.
+- Test a small set of parameter combinations quickly on a MacBook.
+- Find a safer setup before paper/demo trading.
 - Avoid manual guesswork.
 
 This uses the simulated backtester, so the next milestone is real CSV data.
@@ -58,16 +58,17 @@ def metrics(trades) -> tuple[float, float, float, float]:
 
 
 def main() -> None:
-    seeds = [581, 777, 999, 1234, 2026]
-    candles_count = 50000
+    # Fast mode: designed to finish quickly on a MacBook Air.
+    seeds = [581, 999]
+    candles_count = 20000
     point = 0.01
-    max_trades = 200
+    max_trades = 100
 
-    stop_losses = [250, 300, 350]
-    take_profits = [400, 450, 500, 550]
-    lookbacks = [18, 24, 30]
+    stop_losses = [300]
+    take_profits = [450, 500]
+    lookbacks = [24]
     max_consecutive_losses_options = [2, 3]
-    pause_options = [120, 180]
+    pause_options = [120]
 
     results: list[Result] = []
 
@@ -100,28 +101,29 @@ def main() -> None:
             drawdowns.append(drawdown)
             total_trades += len(trades)
 
-        result = Result(
-            sl=sl,
-            tp=tp,
-            lookback=lookback,
-            max_losses=max_losses,
-            pause=pause,
-            seeds_tested=len(seeds),
-            total_trades=total_trades,
-            avg_pnl=sum(pnls) / len(pnls),
-            min_pnl=min(pnls),
-            max_pnl=max(pnls),
-            avg_win_rate=sum(win_rates) / len(win_rates),
-            avg_profit_factor=sum(profit_factors) / len(profit_factors),
-            worst_drawdown=min(drawdowns),
+        results.append(
+            Result(
+                sl=sl,
+                tp=tp,
+                lookback=lookback,
+                max_losses=max_losses,
+                pause=pause,
+                seeds_tested=len(seeds),
+                total_trades=total_trades,
+                avg_pnl=sum(pnls) / len(pnls),
+                min_pnl=min(pnls),
+                max_pnl=max(pnls),
+                avg_win_rate=sum(win_rates) / len(win_rates),
+                avg_profit_factor=sum(profit_factors) / len(profit_factors),
+                worst_drawdown=min(drawdowns),
+            )
         )
-        results.append(result)
 
     results.sort(key=lambda r: (r.min_pnl, r.avg_profit_factor, r.avg_pnl), reverse=True)
 
-    print("\nTop 10 robust settings")
-    print("----------------------")
-    for r in results[:10]:
+    print("\nTop robust settings")
+    print("-------------------")
+    for r in results:
         print(
             f"SL={r.sl} TP={r.tp} lookback={r.lookback} max_losses={r.max_losses} pause={r.pause} | "
             f"trades={r.total_trades} avg_pnl={r.avg_pnl:.0f} min_pnl={r.min_pnl:.0f} "
@@ -130,6 +132,7 @@ def main() -> None:
         )
 
     print("\nRule: prefer settings with positive min_pnl, avg_profit_factor > 1.2, and controlled drawdown.")
+    print("For deeper testing later, increase seeds/candles after this fast check works.")
 
 
 if __name__ == "__main__":
