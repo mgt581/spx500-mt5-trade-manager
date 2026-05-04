@@ -35,12 +35,13 @@ class Trade:
 
 
 class PullbackStrategy:
-    def __init__(self, lookback: int = 20, breakout_buffer: float = 0.5) -> None:
+    def __init__(self, lookback: int = 20, breakout_buffer: float = 3.0, min_trend_slope: float = 0.15) -> None:
         self.lookback = lookback
         self.breakout_buffer = breakout_buffer
+        self.min_trend_slope = min_trend_slope
 
     def signal(self, candles: list[Candle]) -> Signal:
-        if len(candles) < self.lookback + 5:
+        if len(candles) < self.lookback + 10:
             return "HOLD"
 
         closes = [c.close for c in candles]
@@ -48,26 +49,31 @@ class PullbackStrategy:
         lows = [c.low for c in candles]
 
         recent_closes = closes[-self.lookback - 2 : -2]
+        prior_closes = closes[-self.lookback - 8 : -8]
         current = closes[-1]
         previous = closes[-2]
         current_low = lows[-1]
         current_high = highs[-1]
-        average = sum(recent_closes) / len(recent_closes)
-        recent_high = max(recent_closes)
-        recent_low = min(recent_closes)
+        recent_average = sum(recent_closes) / len(recent_closes)
+        prior_average = sum(prior_closes) / len(prior_closes)
+        recent_high = max(highs[-self.lookback - 2 : -2])
+        recent_low = min(lows[-self.lookback - 2 : -2])
+        trend_slope = recent_average - prior_average
 
-        uptrend = average > (sum(closes[-self.lookback - 6 : -6]) / self.lookback)
-        downtrend = average < (sum(closes[-self.lookback - 6 : -6]) / self.lookback)
+        uptrend = trend_slope > self.min_trend_slope
+        downtrend = trend_slope < -self.min_trend_slope
 
         broke_up_recently = previous > recent_high + self.breakout_buffer
-        pulled_back_but_held = current < previous and current_low <= recent_high and current > average
+        pullback_depth_ok = current_low <= recent_high and current > recent_average
+        bullish_rejection = current > candles[-1].open
 
         broke_down_recently = previous < recent_low - self.breakout_buffer
-        pulled_back_but_rejected = current > previous and current_high >= recent_low and current < average
+        pullback_depth_ok_short = current_high >= recent_low and current < recent_average
+        bearish_rejection = current < candles[-1].open
 
-        if uptrend and broke_up_recently and pulled_back_but_held:
+        if uptrend and broke_up_recently and pullback_depth_ok and bullish_rejection:
             return "BUY"
-        if downtrend and broke_down_recently and pulled_back_but_rejected:
+        if downtrend and broke_down_recently and pullback_depth_ok_short and bearish_rejection:
             return "SELL"
         return "HOLD"
 
@@ -76,24 +82,24 @@ def generate_simulated_candles(count: int, start_price: float = 5000.0, seed: in
     random.seed(seed)
     candles: list[Candle] = []
     price = start_price
-    trend = 0.18
+    trend = 0.35
 
     for index in range(count):
-        if index % 180 == 0 and index > 0:
+        if index % 240 == 0 and index > 0:
             trend *= -1
 
         impulse = 0.0
-        if index % 55 in {0, 1, 2}:
-            impulse = trend * 18
-        elif index % 55 in {3, 4, 5}:
-            impulse = -trend * 9
+        if index % 80 in {0, 1, 2, 3}:
+            impulse = trend * 12
+        elif index % 80 in {4, 5, 6}:
+            impulse = -trend * 4
 
-        wave = math.sin(index / 13) * 5
-        noise = random.uniform(-4, 4)
-        close = price + trend + impulse + wave * 0.08 + noise
+        wave = math.sin(index / 17) * 2
+        noise = random.uniform(-2.5, 2.5)
+        close = price + trend + impulse + wave * 0.05 + noise
         open_price = price
-        high = max(open_price, close) + random.uniform(1, 6)
-        low = min(open_price, close) - random.uniform(1, 6)
+        high = max(open_price, close) + random.uniform(0.8, 4)
+        low = min(open_price, close) - random.uniform(0.8, 4)
         candles.append(Candle(open=open_price, high=high, low=low, close=close))
         price = close
 
@@ -110,8 +116,11 @@ def run_backtest(
 ) -> list[Trade]:
     strategy = PullbackStrategy(lookback=lookback)
     trades: list[Trade] = []
+    cooldown_until = 0
 
     for index in range(max(lookback + 10, 30), len(candles) - 1):
+        if index < cooldown_until:
+            continue
         if len(trades) >= max_trades:
             break
 
@@ -121,7 +130,7 @@ def run_backtest(
             continue
 
         entry = candles[index].close
-        future_window = candles[index + 1 : min(index + 13, len(candles))]
+        future_window = candles[index + 1 : min(index + 25, len(candles))]
 
         if signal == "BUY":
             sl = entry - stop_loss_points * point
@@ -156,6 +165,8 @@ def run_backtest(
                 pnl = (entry - future_window[-1].close) / point
                 trades.append(Trade(signal, entry, sl, tp, "TIME_EXIT", pnl))
 
+        cooldown_until = index + 20
+
     return trades
 
 
@@ -185,12 +196,12 @@ def print_report(trades: list[Trade]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a simulated backtest.")
-    parser.add_argument("--candles", type=int, default=2000)
-    parser.add_argument("--sl", type=float, default=250)
-    parser.add_argument("--tp", type=float, default=500)
+    parser.add_argument("--candles", type=int, default=3000)
+    parser.add_argument("--sl", type=float, default=500)
+    parser.add_argument("--tp", type=float, default=350)
     parser.add_argument("--point", type=float, default=0.01)
-    parser.add_argument("--max-trades", type=int, default=100)
-    parser.add_argument("--lookback", type=int, default=20)
+    parser.add_argument("--max-trades", type=int, default=50)
+    parser.add_argument("--lookback", type=int, default=30)
     parser.add_argument("--seed", type=int, default=581)
     args = parser.parse_args()
 
