@@ -22,6 +22,13 @@ from pathlib import Path
 from typing import Any, Literal, Optional
 
 try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ModuleNotFoundError:
+    # python-dotenv is optional for simulation mode. Environment variables still work.
+    pass
+
+try:
     import MetaTrader5 as mt5  # type: ignore
     MT5_AVAILABLE = True
 except ModuleNotFoundError:
@@ -32,14 +39,21 @@ Signal = Literal["BUY", "SELL", "HOLD"]
 TIMEFRAME_M5 = 5
 
 
+def env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 @dataclass(frozen=True)
 class BotConfig:
     symbol: str = os.getenv("BOT_SYMBOL", "SPX500")
     timeframe: int = int(os.getenv("BOT_TIMEFRAME", str(getattr(mt5, "TIMEFRAME_M5", TIMEFRAME_M5))))
     candles: int = int(os.getenv("BOT_CANDLES", "120"))
     poll_seconds: int = int(os.getenv("BOT_POLL_SECONDS", "10"))
-    dry_run: bool = os.getenv("BOT_DRY_RUN", "true").lower() == "true"
-    simulate_data: bool = os.getenv("BOT_SIMULATE_DATA", "false").lower() == "true"
+    dry_run: bool = env_bool("BOT_DRY_RUN", True)
+    simulate_data: bool = env_bool("BOT_SIMULATE_DATA", False)
     risk_percent: float = float(os.getenv("BOT_RISK_PERCENT", "1.0"))
     max_trades_per_day: int = int(os.getenv("BOT_MAX_TRADES_PER_DAY", "3"))
     max_spread_points: float = float(os.getenv("BOT_MAX_SPREAD_POINTS", "50"))
