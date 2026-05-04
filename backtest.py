@@ -155,13 +155,18 @@ def run_backtest(
     lookback: int,
     max_consecutive_losses: int,
     loss_pause_candles: int,
+    max_total_loss_points: float,
 ) -> list[Trade]:
     strategy = PullbackStrategy(lookback=lookback)
     trades: list[Trade] = []
     cooldown_until = 0
     consecutive_losses = 0
+    realised_pnl = 0.0
 
     for index in range(max(lookback + 10, 80), len(candles) - 1):
+        if realised_pnl <= -abs(max_total_loss_points):
+            print(f"Circuit breaker hit: PnL {realised_pnl:.2f} <= -{abs(max_total_loss_points):.2f}")
+            break
         if index < cooldown_until:
             continue
         if len(trades) >= max_trades:
@@ -207,6 +212,7 @@ def run_backtest(
             continue
 
         trades.append(trade)
+        realised_pnl += trade.pnl
         consecutive_losses = consecutive_losses + 1 if trade.pnl < 0 else 0
         cooldown_until = index + 20
         if consecutive_losses >= max_consecutive_losses:
@@ -268,7 +274,8 @@ def main() -> None:
     parser.add_argument("--lookback", type=int, default=24)
     parser.add_argument("--seed", type=int, default=581)
     parser.add_argument("--max-consecutive-losses", type=int, default=2)
-    parser.add_argument("--loss-pause-candles", type=int, default=120)
+    parser.add_argument("--loss-pause-candles", type=int, default=240)
+    parser.add_argument("--max-total-loss-points", type=float, default=900)
     args = parser.parse_args()
 
     candles = generate_simulated_candles(args.candles, seed=args.seed)
@@ -281,6 +288,7 @@ def main() -> None:
         args.lookback,
         args.max_consecutive_losses,
         args.loss_pause_candles,
+        args.max_total_loss_points,
     )
     print_report(trades)
 
