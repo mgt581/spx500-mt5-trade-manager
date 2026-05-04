@@ -35,10 +35,21 @@ class Trade:
 
 
 class PullbackStrategy:
-    def __init__(self, lookback: int = 24, breakout_buffer: float = 2.0, min_impulse: float = 7.5) -> None:
+    def __init__(
+        self,
+        lookback: int = 24,
+        breakout_buffer: float = 2.0,
+        min_impulse: float = 7.5,
+        min_ema_distance: float = 4.0,
+        max_ema_crosses: int = 4,
+        min_recent_range: float = 18.0,
+    ) -> None:
         self.lookback = lookback
         self.breakout_buffer = breakout_buffer
         self.min_impulse = min_impulse
+        self.min_ema_distance = min_ema_distance
+        self.max_ema_crosses = max_ema_crosses
+        self.min_recent_range = min_recent_range
 
     @staticmethod
     def ema(values: list[float], period: int) -> float:
@@ -50,8 +61,20 @@ class PullbackStrategy:
             ema_value = (value - ema_value) * multiplier + ema_value
         return ema_value
 
+    @staticmethod
+    def count_ema_crosses(closes: list[float], ema_value: float) -> int:
+        crosses = 0
+        previous_side = 0
+        for close in closes:
+            side = 1 if close > ema_value else -1 if close < ema_value else 0
+            if previous_side and side and side != previous_side:
+                crosses += 1
+            if side:
+                previous_side = side
+        return crosses
+
     def signal(self, candles: list[Candle]) -> Signal:
-        if len(candles) < max(self.lookback + 10, 60):
+        if len(candles) < max(self.lookback + 10, 80):
             return "HOLD"
 
         closes = [c.close for c in candles]
@@ -62,21 +85,31 @@ class PullbackStrategy:
         previous = candles[-2]
         recent_high = max(highs[-self.lookback - 3 : -3])
         recent_low = min(lows[-self.lookback - 3 : -3])
+        recent_range = recent_high - recent_low
 
         ema_fast = self.ema(closes[-50:], 10)
         ema_slow = self.ema(closes[-80:], 30)
+        ema_distance = abs(ema_fast - ema_slow)
         impulse = abs(previous.close - candles[-6].close)
+        crosses = self.count_ema_crosses(closes[-30:], ema_slow)
 
+        # Chop / no-trade zone: avoid flat or messy markets.
+        if ema_distance < self.min_ema_distance:
+            return "HOLD"
+        if crosses > self.max_ema_crosses:
+            return "HOLD"
+        if recent_range < self.min_recent_range:
+            return "HOLD"
         if impulse < self.min_impulse:
             return "HOLD"
 
         buy_breakout = previous.close > recent_high + self.breakout_buffer
         buy_pullback = current.low <= recent_high and current.close > recent_high and current.close > current.open
-        buy_trend = ema_fast > ema_slow
+        buy_trend = ema_fast > ema_slow and current.close > ema_fast
 
         sell_breakout = previous.close < recent_low - self.breakout_buffer
         sell_pullback = current.high >= recent_low and current.close < recent_low and current.close < current.open
-        sell_trend = ema_fast < ema_slow
+        sell_trend = ema_fast < ema_slow and current.close < ema_fast
 
         if buy_trend and buy_breakout and buy_pullback:
             return "BUY"
@@ -128,7 +161,7 @@ def run_backtest(
     cooldown_until = 0
     consecutive_losses = 0
 
-    for index in range(max(lookback + 10, 60), len(candles) - 1):
+    for index in range(max(lookback + 10, 80), len(candles) - 1):
         if index < cooldown_until:
             continue
         if len(trades) >= max_trades:
