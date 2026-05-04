@@ -1,10 +1,10 @@
 """
-Fast mini optimizer for the SPX500 pullback strategy.
+Ultra-fast mini optimizer for the SPX500 pullback strategy.
 
 Purpose:
-- Test a small set of parameter combinations quickly on a MacBook.
-- Find a safer setup before paper/demo trading.
-- Avoid manual guesswork.
+- Finish quickly on a MacBook Air.
+- Show progress so Terminal does not look frozen.
+- Test a few safer settings before paper/demo trading.
 
 This uses the simulated backtester, so the next milestone is real CSV data.
 """
@@ -58,22 +58,24 @@ def metrics(trades) -> tuple[float, float, float, float]:
 
 
 def main() -> None:
-    # Fast mode: designed to finish quickly on a MacBook Air.
+    # Ultra-fast mode: start small, prove the workflow, then scale up later.
     seeds = [581, 999]
-    candles_count = 20000
+    candles_count = 8000
     point = 0.01
-    max_trades = 100
+    max_trades = 50
 
     stop_losses = [300]
     take_profits = [450, 500]
     lookbacks = [24]
-    max_consecutive_losses_options = [2, 3]
+    max_consecutive_losses_options = [2]
     pause_options = [120]
 
     results: list[Result] = []
-
     combinations = list(product(stop_losses, take_profits, lookbacks, max_consecutive_losses_options, pause_options))
-    print(f"Testing {len(combinations)} parameter sets across {len(seeds)} seeds...")
+    total_jobs = len(combinations) * len(seeds)
+    job_number = 0
+
+    print(f"Testing {len(combinations)} parameter sets across {len(seeds)} seeds ({total_jobs} jobs)...", flush=True)
 
     for sl, tp, lookback, max_losses, pause in combinations:
         pnls: list[float] = []
@@ -83,6 +85,11 @@ def main() -> None:
         total_trades = 0
 
         for seed in seeds:
+            job_number += 1
+            print(
+                f"Job {job_number}/{total_jobs}: SL={sl} TP={tp} lookback={lookback} seed={seed}",
+                flush=True,
+            )
             candles = generate_simulated_candles(candles_count, seed=seed)
             trades = run_backtest(
                 candles=candles,
@@ -132,7 +139,7 @@ def main() -> None:
         )
 
     print("\nRule: prefer settings with positive min_pnl, avg_profit_factor > 1.2, and controlled drawdown.")
-    print("For deeper testing later, increase seeds/candles after this fast check works.")
+    print("This is a quick smoke test. Real CSV market data comes next before paper trading.")
 
 
 if __name__ == "__main__":
