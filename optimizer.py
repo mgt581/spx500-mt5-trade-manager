@@ -24,6 +24,7 @@ class Result:
     lookback: int
     max_losses: int
     pause: int
+    session_filter: bool
     seeds_tested: int
     total_trades: int
     avg_pnl: float
@@ -40,7 +41,6 @@ def metrics(trades) -> tuple[float, float, float, float]:
 
     pnl = sum(t.pnl for t in trades)
     wins = sum(1 for t in trades if t.pnl > 0)
-    losses = sum(1 for t in trades if t.pnl < 0)
     win_rate = wins / len(trades) * 100
     gross_win = sum(t.pnl for t in trades if t.pnl > 0)
     gross_loss = abs(sum(t.pnl for t in trades if t.pnl < 0))
@@ -59,25 +59,35 @@ def metrics(trades) -> tuple[float, float, float, float]:
 
 def main() -> None:
     seeds = [581, 999]
-    candles_count = 8000
+    candles_count = 12000
     point = 0.01
     max_trades = 50
     max_total_loss_points = 900
 
     stop_losses = [300]
     take_profits = [450, 500]
-    lookbacks = [24]
+    lookbacks = [18, 24]
     max_consecutive_losses_options = [2]
     pause_options = [120]
+    session_filter_options = [False, True]
 
     results: list[Result] = []
-    combinations = list(product(stop_losses, take_profits, lookbacks, max_consecutive_losses_options, pause_options))
+    combinations = list(
+        product(
+            stop_losses,
+            take_profits,
+            lookbacks,
+            max_consecutive_losses_options,
+            pause_options,
+            session_filter_options,
+        )
+    )
     total_jobs = len(combinations) * len(seeds)
     job_number = 0
 
     print(f"Testing {len(combinations)} parameter sets across {len(seeds)} seeds ({total_jobs} jobs)...", flush=True)
 
-    for sl, tp, lookback, max_losses, pause in combinations:
+    for sl, tp, lookback, max_losses, pause, session_filter in combinations:
         pnls: list[float] = []
         win_rates: list[float] = []
         profit_factors: list[float] = []
@@ -87,7 +97,8 @@ def main() -> None:
         for seed in seeds:
             job_number += 1
             print(
-                f"Job {job_number}/{total_jobs}: SL={sl} TP={tp} lookback={lookback} seed={seed}",
+                f"Job {job_number}/{total_jobs}: SL={sl} TP={tp} lookback={lookback} "
+                f"session={session_filter} seed={seed}",
                 flush=True,
             )
             candles = generate_simulated_candles(candles_count, seed=seed)
@@ -101,6 +112,14 @@ def main() -> None:
                 max_consecutive_losses=max_losses,
                 loss_pause_candles=pause,
                 max_total_loss_points=max_total_loss_points,
+                min_ema_distance=2.0,
+                max_ema_crosses=6,
+                min_recent_range=12.0,
+                min_atr=1.0,
+                max_atr=25.0,
+                min_body_ratio=0.20,
+                min_ema_slope=0.01,
+                enable_session_filter=session_filter,
             )
             pnl, win_rate, profit_factor, drawdown = metrics(trades)
             pnls.append(pnl)
@@ -116,6 +135,7 @@ def main() -> None:
                 lookback=lookback,
                 max_losses=max_losses,
                 pause=pause,
+                session_filter=session_filter,
                 seeds_tested=len(seeds),
                 total_trades=total_trades,
                 avg_pnl=sum(pnls) / len(pnls),
@@ -127,20 +147,21 @@ def main() -> None:
             )
         )
 
-    results.sort(key=lambda r: (r.min_pnl, r.avg_profit_factor, r.avg_pnl), reverse=True)
+    results.sort(key=lambda r: (r.min_pnl, r.avg_profit_factor, r.avg_pnl, r.total_trades), reverse=True)
 
     print("\nTop robust settings")
     print("-------------------")
     for r in results:
         print(
-            f"SL={r.sl} TP={r.tp} lookback={r.lookback} max_losses={r.max_losses} pause={r.pause} | "
+            f"SL={r.sl} TP={r.tp} lookback={r.lookback} max_losses={r.max_losses} "
+            f"pause={r.pause} session={r.session_filter} | "
             f"trades={r.total_trades} avg_pnl={r.avg_pnl:.0f} min_pnl={r.min_pnl:.0f} "
             f"max_pnl={r.max_pnl:.0f} avg_wr={r.avg_win_rate:.1f}% "
             f"avg_pf={r.avg_profit_factor:.2f} worst_dd={r.worst_drawdown:.0f}"
         )
 
-    print("\nRule: prefer settings with positive min_pnl, avg_profit_factor > 1.2, and controlled drawdown.")
-    print("This is a quick smoke test. Real CSV market data comes next before paper trading.")
+    print("\nRule: prefer settings with positive/least-bad min_pnl, avg_profit_factor > 1.2, and enough trades to matter.")
+    print("This is still simulated data. Real CSV market data comes next before paper trading confidence.")
 
 
 if __name__ == "__main__":
