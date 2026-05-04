@@ -43,6 +43,13 @@ class PullbackStrategy:
         min_ema_distance: float = 4.0,
         max_ema_crosses: int = 4,
         min_recent_range: float = 18.0,
+        min_atr: float = 2.0,
+        max_atr: float = 14.0,
+        min_body_ratio: float = 0.35,
+        min_ema_slope: float = 0.05,
+        session_start_hour: int = 13,
+        session_end_hour: int = 17,
+        enable_session_filter: bool = True,
     ) -> None:
         self.lookback = lookback
         self.breakout_buffer = breakout_buffer
@@ -50,6 +57,13 @@ class PullbackStrategy:
         self.min_ema_distance = min_ema_distance
         self.max_ema_crosses = max_ema_crosses
         self.min_recent_range = min_recent_range
+        self.min_atr = min_atr
+        self.max_atr = max_atr
+        self.min_body_ratio = min_body_ratio
+        self.min_ema_slope = min_ema_slope
+        self.session_start_hour = session_start_hour
+        self.session_end_hour = session_end_hour
+        self.enable_session_filter = enable_session_filter
 
     @staticmethod
     def ema(values: list[float], period: int) -> float:
@@ -60,6 +74,23 @@ class PullbackStrategy:
         for value in values[1:]:
             ema_value = (value - ema_value) * multiplier + ema_value
         return ema_value
+
+    @staticmethod
+    def atr(candles: list[Candle], period: int = 14) -> float:
+        if len(candles) < period + 1:
+            return 0.0
+        ranges: list[float] = []
+        recent = candles[-period:]
+        previous_close = candles[-period - 1].close
+        for candle in recent:
+            true_range = max(
+                candle.high - candle.low,
+                abs(candle.high - previous_close),
+                abs(candle.low - previous_close),
+            )
+            ranges.append(true_range)
+            previous_close = candle.close
+        return sum(ranges) / len(ranges)
 
     @staticmethod
     def count_ema_crosses(closes: list[float], ema_value: float) -> int:
@@ -73,9 +104,14 @@ class PullbackStrategy:
                 previous_side = side
         return crosses
 
-    def signal(self, candles: list[Candle]) -> Signal:
-        if len(candles) < max(self.lookback + 10, 80):
+    def signal(self, candles: list[Candle], candle_index: int | None = None) -> Signal:
+        if len(candles) < max(self.lookback + 10, 90):
             return "HOLD"
+
+        if self.enable_session_filter and candle_index is not None:
+            synthetic_hour = (candle_index // 12) % 24  # M5-style synthetic session clock.
+            if not (self.session_start_hour <= synthetic_hour < self.session_end_hour):
+                return "HOLD"
 
         closes = [c.close for c in candles]
         highs = [c.high for c in candles]
@@ -89,11 +125,18 @@ class PullbackStrategy:
 
         ema_fast = self.ema(closes[-50:], 10)
         ema_slow = self.ema(closes[-80:], 30)
+        ema_slow_previous = self.ema(closes[-86:-6], 30)
+        ema_slope = ema_slow - ema_slow_previous
         ema_distance = abs(ema_fast - ema_slow)
         impulse = abs(previous.close - candles[-6].close)
         crosses = self.count_ema_crosses(closes[-30:], ema_slow)
+        atr_value = self.atr(candles, 14)
 
-        # Chop / no-trade zone: avoid flat or messy markets.
+        body = abs(current.close - current.open)
+        candle_range = max(current.high - current.low, 0.0001)
+        body_ratio = body / candle_range
+
+        # No-trade zone: skip weak, flat, messy, dead, or too-spiky conditions.
         if ema_distance < self.min_ema_distance:
             return "HOLD"
         if crosses > self.max_ema_crosses:
@@ -102,14 +145,18 @@ class PullbackStrategy:
             return "HOLD"
         if impulse < self.min_impulse:
             return "HOLD"
+        if atr_value < self.min_atr or atr_value > self.max_atr:
+            return "HOLD"
+        if body_ratio < self.min_body_ratio:
+            return "HOLD"
 
         buy_breakout = previous.close > recent_high + self.breakout_buffer
         buy_pullback = current.low <= recent_high and current.close > recent_high and current.close > current.open
-        buy_trend = ema_fast > ema_slow and current.close > ema_fast
+        buy_trend = ema_fast > ema_slow and current.close > ema_fast and ema_slope > self.min_ema_slope
 
         sell_breakout = previous.close < recent_low - self.breakout_buffer
         sell_pullback = current.high >= recent_low and current.close < recent_low and current.close < current.open
-        sell_trend = ema_fast < ema_slow and current.close < ema_fast
+        sell_trend = ema_fast < ema_slow and current.close < ema_fast and ema_slope < -self.min_ema_slope
 
         if buy_trend and buy_breakout and buy_pullback:
             return "BUY"
@@ -156,14 +203,32 @@ def run_backtest(
     max_consecutive_losses: int,
     loss_pause_candles: int,
     max_total_loss_points: float,
+    min_ema_distance: float = 4.0,
+    max_ema_crosses: int = 4,
+    min_recent_range: float = 18.0,
+    min_atr: float = 2.0,
+    max_atr: float = 14.0,
+    min_body_ratio: float = 0.35,
+    min_ema_slope: float = 0.05,
+    enable_session_filter: bool = True,
 ) -> list[Trade]:
-    strategy = PullbackStrategy(lookback=lookback)
+    strategy = PullbackStrategy(
+        lookback=lookback,
+        min_ema_distance=min_ema_distance,
+        max_ema_crosses=max_ema_crosses,
+        min_recent_range=min_recent_range,
+        min_atr=min_atr,
+        max_atr=max_atr,
+        min_body_ratio=min_body_ratio,
+        min_ema_slope=min_ema_slope,
+        enable_session_filter=enable_session_filter,
+    )
     trades: list[Trade] = []
     cooldown_until = 0
     consecutive_losses = 0
     realised_pnl = 0.0
 
-    for index in range(max(lookback + 10, 80), len(candles) - 1):
+    for index in range(max(lookback + 10, 90), len(candles) - 1):
         if realised_pnl <= -abs(max_total_loss_points):
             print(f"Circuit breaker hit: PnL {realised_pnl:.2f} <= -{abs(max_total_loss_points):.2f}")
             break
@@ -173,7 +238,7 @@ def run_backtest(
             break
 
         history = candles[: index + 1]
-        signal = strategy.signal(history)
+        signal = strategy.signal(history, candle_index=index)
         if signal == "HOLD":
             continue
 
@@ -276,6 +341,7 @@ def main() -> None:
     parser.add_argument("--max-consecutive-losses", type=int, default=2)
     parser.add_argument("--loss-pause-candles", type=int, default=240)
     parser.add_argument("--max-total-loss-points", type=float, default=900)
+    parser.add_argument("--no-session-filter", action="store_true")
     args = parser.parse_args()
 
     candles = generate_simulated_candles(args.candles, seed=args.seed)
@@ -289,6 +355,7 @@ def main() -> None:
         args.max_consecutive_losses,
         args.loss_pause_candles,
         args.max_total_loss_points,
+        enable_session_filter=not args.no_session_filter,
     )
     print_report(trades)
 
